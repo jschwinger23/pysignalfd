@@ -1,8 +1,9 @@
 import os
+import struct
 import ctypes
 import typing
 import ctypes.util
-from typing import List, Optional
+from typing import List, Optional, Generator
 
 SFD_CLOEXEC = 0o2000000
 SFD_NONBLOCK = 0o4000
@@ -28,23 +29,6 @@ class Sigset(ctypes.Structure):
     def add(self, sig: int) -> None:
         Syscall.sigaddset(self, sig)
 
-    def __repr__(self):
-        ret = []
-        import pdb
-        pdb.set_trace()
-        for i, bitmask in enumerate(self.sig):
-            if bitmask:
-                if mask2list and i <= 1:  # 64 bits in the first two int32s
-                    numbers = mask2list(bitmask)  # sorted from low to high
-                    if i == 1:
-                        numbers = [i << 1 for i in numbers]
-                    for number in numbers:
-                        ret.append(SIGNAMES.get(number, 'SIG%d' % (number,)))
-                else:
-                    strvalue = binrepr and binrepr(bitmask) or str(bitmask)
-                    ret.append('%d: %s' % (i, strvalue))
-        return '{%s}' % (', '.join(ret),)
-
 
 class Syscall:
     libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
@@ -56,7 +40,7 @@ class Syscall:
         '''
         res = cls.libc.signalfd(fd, ctypes.pointer(sigset), flags)
         if res == -1:
-            raise RuntimeError(
+            raise OSError(
                 'signalfd(2) failed with errno: %d' % ctypes.get_errno()
             )
         return res
@@ -68,7 +52,7 @@ class Syscall:
         '''
         res = cls.libc.sigemptyset(ctypes.pointer(sigset))
         if res != 0:
-            raise RuntimeError(
+            raise OSError(
                 'sigemptyset(3) failed with errno: %d' % ctypes.get_errno()
             )
 
@@ -79,7 +63,7 @@ class Syscall:
         '''
         res = cls.libc.sigaddset(ctypes.pointer(sigset), signum)
         if res != 0:
-            raise RuntimeError(
+            raise OSError(
                 'sigaddset(3) failed with errno: %d' % ctypes.get_errno()
             )
 
@@ -90,7 +74,7 @@ class Syscall:
         '''
         res = cls.libc.sigismember(ctypes.pointer(sigset), signum)
         if res == -1:
-            raise RuntimeError(
+            raise OSError(
                 'sigismember(3) failed with errno: %d' % ctypes.get_errno()
             )
         return True if res == 1 else False
@@ -107,13 +91,52 @@ def signalfd(
     return Syscall.signalfd(-1, sigset, flags)
 
 
+def parse_siginfo(fd: int) -> Generator[int, None, None]:
+    '''
+    struct signalfd_siginfo {
+        uint32_t ssi_signo;    /* Signal number */
+        int32_t  ssi_errno;    /* Error number (unused) */
+        int32_t  ssi_code;     /* Signal code */
+        uint32_t ssi_pid;      /* PID of sender */
+        uint32_t ssi_uid;      /* Real UID of sender */
+        int32_t  ssi_fd;       /* File descriptor (SIGIO) */
+        uint32_t ssi_tid;      /* Kernel timer ID (POSIX timers)
+        uint32_t ssi_band;     /* Band event (SIGIO) */
+        uint32_t ssi_overrun;  /* POSIX timer overrun count */
+        uint32_t ssi_trapno;   /* Trap number that caused signal */
+        int32_t  ssi_status;   /* Exit status or signal (SIGCHLD) */
+        int32_t  ssi_int;      /* Integer sent by sigqueue(3) */
+        uint64_t ssi_ptr;      /* Pointer sent by sigqueue(3) */
+        uint64_t ssi_utime;    /* User CPU time consumed (SIGCHLD) */
+        uint64_t ssi_stime;    /* System CPU time consumed
+                                  (SIGCHLD) */
+        uint64_t ssi_addr;     /* Address that generated signal
+                                  (for hardware-generated signals) */
+        uint16_t ssi_addr_lsb; /* Least significant bit of address
+                                  (SIGBUS; since Linux 2.6.37)
+        uint8_t  pad[X];       /* Pad size to 128 bytes (allow for
+                                  additional fields in the future) */
+    };
+    '''
+    while True:
+        try:
+            buf = os.read(fd, 128)  # magic number, don't ask
+        except BlockingIOError:
+            return
+        signum, *_ = struct.unpack('I', buf[:4])
+        yield signum
+
+
 if __name__ == '__main__':
     import signal
     signal.pthread_sigmask(signal.SIG_BLOCK, [1, 2])
     fd = signalfd([1, 2], NONBLOCK=True, CLOEXEC=True)
 
     def hand(fd, mask):
-        print(os.read(fd, 10000))
+        import time
+        time.sleep(10)
+        for signum in parse_siginfo(fd):
+            print(signum)
 
     import selectors
     sel = selectors.DefaultSelector()
